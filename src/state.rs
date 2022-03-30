@@ -8,8 +8,6 @@ use crate::{
     utils::try_from_slice_checked
 };
 
-pub const PREFIX: &str = "FantasyCrypto";
-
 // BET ACCOUNT
 pub const BET_DIRECTION_DATA_LENGTH: usize = 5;
 pub const MAX_BET_DATA_LENGTH: usize = 1 + 32 + 32 + 1 + 32 + 2 + 8 + 32 + 32 + 8 + BET_DIRECTION_DATA_LENGTH + 8 + 8 + 8 + 8 + 8;
@@ -28,7 +26,7 @@ pub struct BetAccount {
     pub pyth_oracle_price_account: Pubkey,
     pub expiration_time: i64,
     pub bet_direction: String, // "above" / "below"
-    pub bet_price: u64,
+    pub bet_price: i64,
     pub cancel_price: i64,
     pub cancel_time: i64,
     pub variable_odds: i64,

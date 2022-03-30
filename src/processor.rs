@@ -8,27 +8,31 @@ use solana_program::{
     program::{invoke, invoke_signed},
     clock::{Clock},
     system_program::{check_id},
-    system_instruction
+    system_instruction,
+    program_error::ProgramError
 };
 
 use spl_token::state::Account as TokenAccount;
 
 use crate::{
-    instruction::FantasyCryptoInstruction,
+    instruction::BetInstruction,
     error::BetError,
     utils::PREFIX,
     utils::create_or_allocate_account_raw,
     utils::puffed_out_string,
-    state::TournamentAccount,
+    state::BetAccount,
+    pyth
 };
 
-// use std::convert::TryInto;
+use std::convert::TryInto;
 use borsh::{BorshSerialize, BorshDeserialize};
 
 use pyth_client::{
+    Product,
     Price,
     PriceConf,
-    load_price
+    load_price,
+    load_product
 };
 
 pub fn process_instruction<'a>(
@@ -36,137 +40,202 @@ pub fn process_instruction<'a>(
     accounts: &'a [AccountInfo<'a>],
     input: &[u8],
 ) -> ProgramResult {
-    let instruction = FantasyCryptoInstruction::try_from_slice(input)?;
+    let instruction = BetInstruction::try_from_slice(input)?;
     match instruction {
-        FantasyCryptoInstruction::CreateTournament(args) => {
-            msg!("Instruction: Create Tournament");
-            process_create_tournament(
+        BetInstruction::CreateBet(args) => {
+            msg!("Instruction: Create Bet");
+            process_create_bet(
                 program_id,
                 accounts,
-                args.entry_fee,
-                args.commission_basis_points,
-                args.max_num_players,
-                args.product_account_list,
-                args.duration,
-                args.pay_with_sol,
-                args.payment_token_mint,
+                args.sol_payment,
+                args.bet_size,
+                args.odds,
+                args.expiration_time,
+                args.bet_direction,
+                args.bet_price,
+                args.cancel_price,
+                args.cancel_time,
+                args.variable_odds,
             )
         },
     }
 }
 
-pub fn process_create_tournament<'a>(
+pub fn process_create_bet<'a>(
     program_id: &'a Pubkey,
     accounts: &'a [AccountInfo<'a>],
-    entry_fee: u64,
-    commission_basis_points: u16,
-    max_num_players: u8,
-    product_account_list: Vec<Pubkey>,
-    duration: u64,
-    pay_with_sol: bool,
-    payment_token_mint: Option<Pubkey>,
+    sol_payment: bool,
+    bet_size: u64,
+    odds: u16,
+    expiration_time: i64,
+    bet_direction: String,
+    bet_price: i64,
+    cancel_price: i64,
+    cancel_time: i64,
+    variable_odds: i64,
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
-    let creator_account_info = next_account_info(account_info_iter)?;
-    let tournament_state_account_info = next_account_info(account_info_iter)?;
-    let prize_pool_account_info = next_account_info(account_info_iter)?;
-    let commission_account_info = next_account_info(account_info_iter)?;
+    let creator_main_account_info = next_account_info(account_info_iter)?;
+    let creator_payment_account_info = next_account_info(account_info_iter)?;
+    let bet_state_account_info = next_account_info(account_info_iter)?;
+    let bet_escrow_account_info = next_account_info(account_info_iter)?;
+    let pyth_oracle_product_account_info = next_account_info(account_info_iter)?;
+    let pyth_oracle_price_account_info = next_account_info(account_info_iter)?;
     let rent = &Rent::from_account_info(next_account_info(account_info_iter)?)?;
-    let token_program_account = next_account_info(account_info_iter)?;
-    spl_token::check_program_account(token_program_account.key)?;
+    let token_program_account_info = next_account_info(account_info_iter)?;
+    spl_token::check_program_account(token_program_account_info.key)?;
+    let system_program_account_info = next_account_info(account_info_iter)?;
+    if check_id(system_program_account_info.key) == false {
+        return Err(BetError::InvalidSystemProgram.into());
+    }
 
     // check creator_account_info is the tx signer
-    if !creator_account_info.is_signer {
+    if !creator_main_account_info.is_signer {
         return Err(BetError::IncorrectSigner.into());
     }
 
-    // check program is owner of the tournament_state_account_info
-    if tournament_state_account_info.owner != program_id {
+    // check program is owner of the bet_state_account_info
+    if bet_state_account_info.owner != program_id {
         return Err(BetError::IncorrectOwner.into());
     }
 
-    // check tournament_state_account_info has enough lamports to be rent exempt
-    if !rent.is_exempt(tournament_state_account_info.lamports(), tournament_state_account_info.data_len()) {
+    // check bet_state_account_info has enough lamports to be rent exempt
+    if !rent.is_exempt(bet_state_account_info.lamports(), bet_state_account_info.data_len()) {
         return Err(BetError::NotRentExempt.into());
     }
 
-    // check if it is a tournament with entry paid in SOL
-    if pay_with_sol == true {
-        // if yes, check that the program id is owner of the prize pool account
-        if prize_pool_account_info.owner != program_id {
+    // unpack the bet_state_account_info
+    let mut bet_state_account = BetAccount::from_account_info(&bet_state_account_info)?;
+
+    // check if bet payment is SOL or a token
+    if sol_payment == true {
+        // if yes, check that the program id is owner of the bet escrow account
+        if bet_escrow_account_info.owner != program_id {
             return Err(BetError::IncorrectOwner.into());
         }
-    } else if pay_with_sol == false {
-        // if no, check prize pool and commission accounts are token accounts with mint = payment_token_mint
-        if *prize_pool_account_info.owner != spl_token::ID || *commission_account_info.owner != spl_token::ID {
+    } else {
+        // if no, check bet escrow account is a token account with mint same as creator payment account
+        if *bet_escrow_account_info.owner != spl_token::ID {
             return Err(BetError::IsNotTokenAccount.into());
         }
         // unpack the token account data
-        let prize_pool_account = TokenAccount::unpack_from_slice(&prize_pool_account_info.data.borrow())?;
-        let commission_account = TokenAccount::unpack_from_slice(&commission_account_info.data.borrow())?;
-        // panics if pay with sol is false but we don't have a payment token mint
-        if prize_pool_account.mint != payment_token_mint.unwrap() || commission_account.mint != payment_token_mint.unwrap() {
+        let bet_escrow_account = TokenAccount::unpack_from_slice(&bet_escrow_account_info.data.borrow())?;
+        let creator_payment_account = TokenAccount::unpack_from_slice(&creator_payment_account_info.data.borrow())?;
+
+        // return error if sol payment is false but we don't have a payment token mint
+        if bet_escrow_account.mint != creator_payment_account.mint {
             return Err(BetError::InvalidMint.into());
         }
 
-        // get the PDA account Pubkey (derived from the tournament_state_account_info Pubkey and prefix "FantasyCrypto")
-        let prize_pool_account_seeds = &[
+        // write the payment token mint to bet state account
+        bet_state_account.payment_mint = bet_escrow_account.mint;
+
+        // get the PDA account Pubkey (derived from the bet_escrow_account_info Pubkey and prefix "yoyobet")
+        let bet_escrow_account_seeds = &[
             PREFIX.as_bytes(),
-            tournament_state_account_info.key.as_ref(),
+            bet_escrow_account_info.key.as_ref(),
         ];
-        let (prize_pool_account_pda, _bump_seed) = Pubkey::find_program_address(prize_pool_account_seeds, program_id);
+        let (bet_escrow_account_pda, _bump_seed) = Pubkey::find_program_address(bet_escrow_account_seeds, program_id);
 
         
-        // call token program to transfer ownership of prize pool account to PDA
+        // call token program to transfer ownership of bet escrow account to PDA
         let transfer_authority_change_ix = spl_token::instruction::set_authority(
-            token_program_account.key,
-            prize_pool_account_info.key,
-            Some(&prize_pool_account_pda),
+            token_program_account_info.key,
+            bet_escrow_account_info.key,
+            Some(&bet_escrow_account_pda),
             spl_token::instruction::AuthorityType::AccountOwner,
-            creator_account_info.key,
-            &[&creator_account_info.key],
+            creator_main_account_info.key,
+            &[&creator_main_account_info.key],
         )?;
         msg!("Calling the token program to transfer ownership authority to PDA...");
         invoke(
             &transfer_authority_change_ix,
             &[
-                prize_pool_account_info.clone(),
-                creator_account_info.clone(),
-                token_program_account.clone(),
+                bet_escrow_account_info.clone(),
+                creator_main_account_info.clone(),
+                token_program_account_info.clone(),
             ],
         )?;
     }
-    
-    // unpack the tournament_state_account_info
-    let mut tournament_state_account = TournamentAccount::from_account_info(&tournament_state_account_info)?;
+
+    // check valid pyth keys
+    validate_pyth_keys(pyth_oracle_product_account_info, pyth_oracle_price_account_info)?;
 
     // check tournament state account hasn't already been initialized
-    if tournament_state_account.is_initialized == true {
-        return Err(BetError::InvalidTournamentAccount.into())
+    if bet_state_account.is_initialized == true {
+        return Err(BetError::AccountAlreadyInitialized.into())
     }
 
     // write the data to state
-    tournament_state_account.is_initialized = true;
-    tournament_state_account.creator = *creator_account_info.key;
-    tournament_state_account.started = false;
-    tournament_state_account.finalized = false;
-    tournament_state_account.entry_fee = entry_fee;
-    tournament_state_account.commission_basis_points = commission_basis_points;
-    tournament_state_account.max_num_players = max_num_players;
-    tournament_state_account.product_account_list = product_account_list;
-    tournament_state_account.start_timestamp = 0;
-    tournament_state_account.duration = duration;
-    tournament_state_account.pay_with_sol = pay_with_sol;
-    tournament_state_account.payment_token_mint = payment_token_mint;
-    tournament_state_account.prize_pool_account = *prize_pool_account_info.key;
-    tournament_state_account.commission_account = *commission_account_info.key;
-    let players: Vec<Pubkey> = Vec::new();
-    tournament_state_account.players = players;
-    let starting_prices: Vec<PriceConf> = Vec::new();
-    tournament_state_account.starting_prices = starting_prices;
+    bet_state_account.is_initialized = true;
+    bet_state_account.creator_main_account = *creator_main_account_info.key;
+    bet_state_account.creator_payment_account = *creator_payment_account_info.key;
+    bet_state_account.sol_payment = sol_payment;
+    bet_state_account.odds = odds;
+    bet_state_account.bet_size = bet_size;
+    bet_state_account.pyth_oracle_product_account = *pyth_oracle_product_account_info.key;
+    bet_state_account.pyth_oracle_price_account = *pyth_oracle_price_account_info.key;
+    bet_state_account.expiration_time = expiration_time;
+    bet_state_account.bet_direction = bet_direction;
+    bet_state_account.bet_price = bet_price;
+    bet_state_account.cancel_price = cancel_price;
+    bet_state_account.cancel_time = cancel_time;
+    bet_state_account.variable_odds = variable_odds;
+    bet_state_account.total_amount_accepted = 0;
 
     // pack the tournament_state_account
-    tournament_state_account.serialize(&mut &mut tournament_state_account_info.data.borrow_mut()[..])?;
+    bet_state_account.serialize(&mut &mut bet_state_account_info.data.borrow_mut()[..])?;
    
+    Ok(())
+}
+
+/// validates pyth AccountInfos
+#[inline(always)]
+fn validate_pyth_keys(
+    // lending_market: &LendingMarket,
+    pyth_product_info: &AccountInfo,
+    pyth_price_info: &AccountInfo,
+) -> ProgramResult {
+
+    // if &lending_market.oracle_program_id != pyth_product_info.owner {
+    //     msg!("Pyth product account provided is not owned by the lending market oracle program");
+    //     return Err(BetError::InvalidOracleConfig.into());
+    // }
+    // if &lending_market.oracle_program_id != pyth_price_info.owner {
+    //     msg!("Pyth price account provided is not owned by the lending market oracle program");
+    //     return Err(BetError::InvalidOracleConfig.into());
+    // }
+
+    let pyth_product_data = pyth_product_info.try_borrow_data()?;
+    let pyth_product = pyth::load::<pyth::Product>(&pyth_product_data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if pyth_product.magic != pyth::MAGIC {
+        msg!("Pyth product account provided is not a valid Pyth account");
+        return Err(BetError::InvalidOracleConfig.into());
+    }
+    if pyth_product.ver != pyth::VERSION_2 {
+        msg!("Pyth product account provided has a different version than expected");
+        return Err(BetError::InvalidOracleConfig.into());
+    }
+    if pyth_product.atype != pyth::AccountType::Product as u32 {
+        msg!("Pyth product account provided is not a valid Pyth product account");
+        return Err(BetError::InvalidOracleConfig.into());
+    }
+
+    let pyth_price_pubkey_bytes: &[u8; 32] = pyth_price_info
+        .key
+        .as_ref()
+        .try_into()
+        .map_err(|_| BetError::InvalidAccountInput)?;
+    if &pyth_product.px_acc.val != pyth_price_pubkey_bytes {
+        msg!("Pyth product price account does not match the Pyth price provided");
+        return Err(BetError::InvalidOracleConfig.into());
+    }
+
+    // let quote_currency = get_pyth_product_quote_currency(pyth_product)?;
+    // if lending_market.quote_currency != quote_currency {
+    //     msg!("Lending market quote currency does not match the oracle quote currency");
+    //     return Err(BetError::InvalidOracleConfig.into());
+    // }
     Ok(())
 }

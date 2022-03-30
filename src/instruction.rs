@@ -10,15 +10,15 @@ use solana_program::{
 #[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone)]
 /// Args for create bet
 pub struct CreateBetArgs {
-    sol_payment: bool, // true is paid with SOL, false is paid with a token
-    bet_size: u64,
-    odds: u16, // the odds given for the bet, e.g. even odds = 2.00 = 200
-    expiration_time: i64, // the time at which the bet expires
-    bet_direction: String, // "above" / "below"
-    bet_price: i64, // the price the asset must be above/below at expiration time
-    cancel_price: i64, // the price at which the bet is no longer valid and thus can no longer be accepted
-    cancel_time: i64, // the time at which the bet is no longer valid and thus can no longer be accepted
-    variable_odds: i64, // the amount price must change for odds to increase by 0.01
+    pub sol_payment: bool, // true is paid with SOL, false is paid with a token
+    pub bet_size: u64,
+    pub odds: u16, // the odds given for the bet, e.g. even odds = 2.00 = 200
+    pub expiration_time: i64, // the time at which the bet expires
+    pub bet_direction: String, // "above" / "below"
+    pub bet_price: i64, // the price the asset must be above/below at expiration time
+    pub cancel_price: i64, // the price at which the bet is no longer valid and thus can no longer be accepted
+    pub cancel_time: i64, // the time at which the bet is no longer valid and thus can no longer be accepted
+    pub variable_odds: i64, // the amount price must change for odds to increase by 0.01
 }
 
 /// Instructions supported by the YoYo Bet program

@@ -15,7 +15,7 @@ use crate::{
     error::BetError
 };
 
-pub const PREFIX: &str = "distributor";
+pub const PREFIX: &str = "yoyobet";
 
 pub fn try_from_slice_checked<T: BorshDeserialize>(
     data: &[u8],

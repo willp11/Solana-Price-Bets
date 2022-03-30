@@ -40,13 +40,17 @@ pub enum BetError {
     #[error("Account is not token account")]
     IsNotTokenAccount,
 
+    // Account already initialized
+    #[error("Account already initialized")]
+    AccountAlreadyInitialized,
+
     // Invalid accounts
     #[error("Invalid accounts")]
     InvalidAccounts,
 
     // Invalid tournament account
-    #[error("Invalid tournament account")]
-    InvalidTournamentAccount,
+    #[error("Invalid bet account")]
+    InvalidBetAccount,
 
     // Invalid system program
     #[error("Invalid system program")]
@@ -67,6 +71,14 @@ pub enum BetError {
     // Invalid price account
     #[error("Invalid price account")]
     InvalidPriceAccount,
+
+    // Invalid account input
+    #[error("Invalid price account")]
+    InvalidAccountInput,
+
+    // Invalid oracle config
+    #[error("Invalid oracle config")]
+    InvalidOracleConfig,
 }
 
 impl PrintProgramError for BetError {
