@@ -79,6 +79,10 @@ pub enum BetError {
     // Invalid oracle config
     #[error("Invalid oracle config")]
     InvalidOracleConfig,
+
+    // No Payment Mint Given
+    #[error("No payment mint given")]
+    NoPaymentMintGiven,
 }
 
 impl PrintProgramError for BetError {

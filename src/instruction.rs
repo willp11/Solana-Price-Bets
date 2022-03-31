@@ -8,9 +8,16 @@ use solana_program::{
 
 #[repr(C)]
 #[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone)]
+/// Args for init betting market
+pub struct InitBettingMarketArgs {
+    pub sol_payment: bool, // true is paid with SOL, false is paid with a token
+    pub payment_mint: Option<Pubkey>
+}
+
+#[repr(C)]
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone)]
 /// Args for create bet
 pub struct CreateBetArgs {
-    pub sol_payment: bool, // true is paid with SOL, false is paid with a token
     pub bet_size: u64,
     pub odds: u16, // the odds given for the bet, e.g. even odds = 2.00 = 200
     pub expiration_time: i64, // the time at which the bet expires
@@ -24,16 +31,50 @@ pub struct CreateBetArgs {
 /// Instructions supported by the YoYo Bet program
 #[derive(BorshSerialize, BorshDeserialize, Clone)]
 pub enum BetInstruction {
+    // [signer] owner_account
+    // [writable] betting_market_account
+    // [] commission_fee_account
+    // [] pyth_program
+    InitBettingMarket(InitBettingMarketArgs),
+
     // [signer] creator_main_account
     // [writable] creator_payment_account
     // [writable] bet_state_account
     // [writable] bet_escrow_account
+    // [] betting_market_account
     // [] pyth_oracle_product_account
     // [] pyth_oracle_price_account
     // [] rent_sysvar
     // [] system_program
     // [] token_program
     CreateBet(CreateBetArgs),
+}
+
+/// Creates a InitBettingMarket Instruction
+pub fn init_betting_market(
+    program_id: Pubkey,
+    owner_account: Pubkey,
+    betting_market_account: Pubkey,
+    commission_fee_account: Pubkey,
+    pyth_program: Pubkey,
+    sol_payment: bool,
+    payment_mint: Option<Pubkey>
+) -> Instruction {
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(owner_account, true),
+            AccountMeta::new(betting_market_account, false),
+            AccountMeta::new_readonly(commission_fee_account, false),
+            AccountMeta::new_readonly(pyth_program, false)
+        ],
+        data: BetInstruction::InitBettingMarket(InitBettingMarketArgs {
+            sol_payment: sol_payment,
+            payment_mint: payment_mint
+        })
+        .try_to_vec()
+        .unwrap()
+    }
 }
 
 /// Creates a CreateBet Instruction
@@ -44,9 +85,9 @@ pub fn create_bet(
     creator_payment_account: Pubkey,
     bet_state_account: Pubkey,
     bet_escrow_account: Pubkey,
+    betting_market_account: Pubkey,
     pyth_oracle_product_account: Pubkey,
     pyth_oracle_price_account: Pubkey,
-    sol_payment: bool,
     bet_size: u64,
     odds: u16,
     expiration_time: i64,
@@ -63,6 +104,7 @@ pub fn create_bet(
             AccountMeta::new(creator_payment_account, false),
             AccountMeta::new(bet_state_account, false),
             AccountMeta::new(bet_escrow_account, false),
+            AccountMeta::new_readonly(betting_market_account, false),
             AccountMeta::new_readonly(pyth_oracle_product_account, false),
             AccountMeta::new_readonly(pyth_oracle_price_account, false),
             AccountMeta::new_readonly(sysvar::rent::id(), false),
@@ -70,7 +112,6 @@ pub fn create_bet(
             AccountMeta::new_readonly(system_program::id(), false)
         ],
         data: BetInstruction::CreateBet(CreateBetArgs {
-            sol_payment,
             bet_size,
             odds,
             expiration_time,

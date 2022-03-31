@@ -20,7 +20,7 @@ use crate::{
     utils::PREFIX,
     utils::create_or_allocate_account_raw,
     utils::puffed_out_string,
-    state::BetAccount,
+    state::{BettingMarket, Bet},
     pyth
 };
 
@@ -42,12 +42,20 @@ pub fn process_instruction<'a>(
 ) -> ProgramResult {
     let instruction = BetInstruction::try_from_slice(input)?;
     match instruction {
+        BetInstruction::InitBettingMarket(args) => {
+            msg!("Instruction: Init Betting Market");
+            process_init_betting_market(
+                program_id, 
+                accounts, 
+                args.sol_payment, 
+                args.payment_mint
+            )
+        },
         BetInstruction::CreateBet(args) => {
             msg!("Instruction: Create Bet");
             process_create_bet(
                 program_id,
                 accounts,
-                args.sol_payment,
                 args.bet_size,
                 args.odds,
                 args.expiration_time,
@@ -61,10 +69,42 @@ pub fn process_instruction<'a>(
     }
 }
 
-pub fn process_create_bet<'a>(
+pub fn process_init_betting_market<'a>(
     program_id: &'a Pubkey,
     accounts: &'a [AccountInfo<'a>],
     sol_payment: bool,
+    payment_mint: Option<Pubkey>
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let owner_account_info = next_account_info(account_info_iter)?;
+    let betting_market_account_info = next_account_info(account_info_iter)?;
+    let commission_fee_account_info = next_account_info(account_info_iter)?;
+    let pyth_program = next_account_info(account_info_iter)?;
+
+    if !owner_account_info.is_signer {
+        return Err(BetError::IncorrectOwner.into());
+    }
+
+    let mut betting_market_account = BettingMarket::from_account_info(betting_market_account_info)?;
+
+    if sol_payment == false {
+        if let Some(mint) = payment_mint {
+            betting_market_account.payment_mint = Some(mint);
+        } else {
+            return Err(BetError::NoPaymentMintGiven.into());
+        }
+    }
+    betting_market_account.owner = *owner_account_info.key;
+    betting_market_account.sol_payment = sol_payment;
+    betting_market_account.fee_commission_account = *commission_fee_account_info.key;
+    betting_market_account.pyth_program_id = *pyth_program.key;
+
+    Ok(())
+}
+
+pub fn process_create_bet<'a>(
+    program_id: &'a Pubkey,
+    accounts: &'a [AccountInfo<'a>],
     bet_size: u64,
     odds: u16,
     expiration_time: i64,
@@ -79,6 +119,7 @@ pub fn process_create_bet<'a>(
     let creator_payment_account_info = next_account_info(account_info_iter)?;
     let bet_state_account_info = next_account_info(account_info_iter)?;
     let bet_escrow_account_info = next_account_info(account_info_iter)?;
+    let betting_market_account_info = next_account_info(account_info_iter)?;
     let pyth_oracle_product_account_info = next_account_info(account_info_iter)?;
     let pyth_oracle_price_account_info = next_account_info(account_info_iter)?;
     let rent = &Rent::from_account_info(next_account_info(account_info_iter)?)?;
@@ -105,30 +146,31 @@ pub fn process_create_bet<'a>(
     }
 
     // unpack the bet_state_account_info
-    let mut bet_state_account = BetAccount::from_account_info(&bet_state_account_info)?;
+    let mut bet_state_account = Bet::from_account_info(&bet_state_account_info)?;
+    // unpack the betting_market_account_info
+    let betting_market_account = BettingMarket::from_account_info(&betting_market_account_info)?;
 
     // check if bet payment is SOL or a token
-    if sol_payment == true {
+    if betting_market_account.sol_payment == true {
         // if yes, check that the program id is owner of the bet escrow account
         if bet_escrow_account_info.owner != program_id {
             return Err(BetError::IncorrectOwner.into());
         }
     } else {
-        // if no, check bet escrow account is a token account with mint same as creator payment account
-        if *bet_escrow_account_info.owner != spl_token::ID {
+        // if no, check bet escrow account and creator payment account are token accounts 
+        if *bet_escrow_account_info.owner != spl_token::ID || *creator_payment_account_info.owner != spl_token::ID {
             return Err(BetError::IsNotTokenAccount.into());
         }
         // unpack the token account data
         let bet_escrow_account = TokenAccount::unpack_from_slice(&bet_escrow_account_info.data.borrow())?;
         let creator_payment_account = TokenAccount::unpack_from_slice(&creator_payment_account_info.data.borrow())?;
 
-        // return error if sol payment is false but we don't have a payment token mint
-        if bet_escrow_account.mint != creator_payment_account.mint {
-            return Err(BetError::InvalidMint.into());
+        // check the escrow and payment accounts have the same mint and that it is same mint as in the betting market account
+        if let Some(payment_mint) = betting_market_account.payment_mint {
+            if bet_escrow_account.mint != creator_payment_account.mint || bet_escrow_account.mint != payment_mint {
+                return Err(BetError::InvalidMint.into());
+            }
         }
-
-        // write the payment token mint to bet state account
-        bet_state_account.payment_mint = bet_escrow_account.mint;
 
         // get the PDA account Pubkey (derived from the bet_escrow_account_info Pubkey and prefix "yoyobet")
         let bet_escrow_account_seeds = &[
@@ -159,7 +201,11 @@ pub fn process_create_bet<'a>(
     }
 
     // check valid pyth keys
-    validate_pyth_keys(pyth_oracle_product_account_info, pyth_oracle_price_account_info)?;
+    validate_pyth_keys(
+        &betting_market_account.pyth_program_id,
+        pyth_oracle_product_account_info, 
+        pyth_oracle_price_account_info
+    )?;
 
     // check tournament state account hasn't already been initialized
     if bet_state_account.is_initialized == true {
@@ -170,7 +216,6 @@ pub fn process_create_bet<'a>(
     bet_state_account.is_initialized = true;
     bet_state_account.creator_main_account = *creator_main_account_info.key;
     bet_state_account.creator_payment_account = *creator_payment_account_info.key;
-    bet_state_account.sol_payment = sol_payment;
     bet_state_account.odds = odds;
     bet_state_account.bet_size = bet_size;
     bet_state_account.pyth_oracle_product_account = *pyth_oracle_product_account_info.key;
@@ -189,22 +234,22 @@ pub fn process_create_bet<'a>(
     Ok(())
 }
 
-/// validates pyth AccountInfos
+/// validates pyth AccountInfos - Thank you Solend
 #[inline(always)]
 fn validate_pyth_keys(
-    // lending_market: &LendingMarket,
+    oracle_program_id: &Pubkey,
     pyth_product_info: &AccountInfo,
     pyth_price_info: &AccountInfo,
 ) -> ProgramResult {
 
-    // if &lending_market.oracle_program_id != pyth_product_info.owner {
-    //     msg!("Pyth product account provided is not owned by the lending market oracle program");
-    //     return Err(BetError::InvalidOracleConfig.into());
-    // }
-    // if &lending_market.oracle_program_id != pyth_price_info.owner {
-    //     msg!("Pyth price account provided is not owned by the lending market oracle program");
-    //     return Err(BetError::InvalidOracleConfig.into());
-    // }
+    if oracle_program_id != pyth_product_info.owner {
+        msg!("Pyth product account provided is not owned by the Pyth oracle program");
+        return Err(BetError::InvalidOracleConfig.into());
+    }
+    if oracle_program_id != pyth_price_info.owner {
+        msg!("Pyth price account provided is not owned by the Pyth oracle program");
+        return Err(BetError::InvalidOracleConfig.into());
+    }
 
     let pyth_product_data = pyth_product_info.try_borrow_data()?;
     let pyth_product = pyth::load::<pyth::Product>(&pyth_product_data)
