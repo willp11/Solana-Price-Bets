@@ -20,7 +20,7 @@ use crate::{
     utils::PREFIX,
     utils::create_or_allocate_account_raw,
     utils::puffed_out_string,
-    state::{BettingMarket, Bet},
+    state::{BettingMarket, Bet, Direction, CancelCondition, AcceptedBet},
     pyth
 };
 
@@ -61,11 +61,18 @@ pub fn process_instruction<'a>(
                 args.expiration_time,
                 args.bet_direction,
                 args.bet_price,
-                args.cancel_price,
-                args.cancel_time,
+                args.cancel_condition,
                 args.variable_odds,
             )
         },
+        BetInstruction::AcceptBet(args) => {
+            msg!("Instruction: Accept Bet");
+            process_accept_bet(
+                program_id,
+                accounts,
+                args.bet_size
+            )
+        }
     }
 }
 
@@ -81,7 +88,13 @@ pub fn process_init_betting_market<'a>(
     let commission_fee_account_info = next_account_info(account_info_iter)?;
     let pyth_program = next_account_info(account_info_iter)?;
 
+    // check owner signed tx
     if !owner_account_info.is_signer {
+        return Err(BetError::IncorrectOwner.into());
+    }
+
+    // check program is owner of the bet_state_account_info
+    if betting_market_account_info.owner != program_id {
         return Err(BetError::IncorrectOwner.into());
     }
 
@@ -106,13 +119,12 @@ pub fn process_create_bet<'a>(
     program_id: &'a Pubkey,
     accounts: &'a [AccountInfo<'a>],
     bet_size: u64,
-    odds: u16,
+    odds: i64,
     expiration_time: i64,
-    bet_direction: String,
+    bet_direction: Direction,
     bet_price: i64,
-    cancel_price: i64,
-    cancel_time: i64,
-    variable_odds: i64,
+    cancel_condition: CancelCondition,
+    variable_odds: Option<i64>,
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
     let creator_main_account_info = next_account_info(account_info_iter)?;
@@ -156,6 +168,11 @@ pub fn process_create_bet<'a>(
         if bet_escrow_account_info.owner != program_id {
             return Err(BetError::IncorrectOwner.into());
         }
+
+        // check escrow account has enough lamports for the bet
+        if bet_escrow_account_info.lamports() < bet_size {
+            return Err(BetError::AmountUnderflow.into());
+        }
     } else {
         // if no, check bet escrow account and creator payment account are token accounts 
         if *bet_escrow_account_info.owner != spl_token::ID || *creator_payment_account_info.owner != spl_token::ID {
@@ -170,6 +187,11 @@ pub fn process_create_bet<'a>(
             if bet_escrow_account.mint != creator_payment_account.mint || bet_escrow_account.mint != payment_mint {
                 return Err(BetError::InvalidMint.into());
             }
+        }
+
+        // check escrow account has enough tokens for the bet
+        if bet_escrow_account.amount < bet_size {
+            return Err(BetError::AmountUnderflow.into());
         }
 
         // get the PDA account Pubkey (derived from the bet_escrow_account_info Pubkey and prefix "yoyobet")
@@ -212,6 +234,16 @@ pub fn process_create_bet<'a>(
         return Err(BetError::AccountAlreadyInitialized.into())
     }
 
+    // get the price from oracle (used for variable odds)
+    let pyth_price_data = pyth_oracle_price_account_info.try_borrow_data()?;
+    let price_account: Price = *load_price( &pyth_price_data ).unwrap();
+    let price: PriceConf = price_account.get_current_price().unwrap();
+
+    // assert odds aren't less than 100
+    if odds < 100 {
+        return Err(BetError::InvalidOdds.into());
+    }
+
     // write the data to state
     bet_state_account.is_initialized = true;
     bet_state_account.creator_main_account = *creator_main_account_info.key;
@@ -223,14 +255,193 @@ pub fn process_create_bet<'a>(
     bet_state_account.expiration_time = expiration_time;
     bet_state_account.bet_direction = bet_direction;
     bet_state_account.bet_price = bet_price;
-    bet_state_account.cancel_price = cancel_price;
-    bet_state_account.cancel_time = cancel_time;
+    bet_state_account.start_price = price.price;
+    bet_state_account.cancel_condition = cancel_condition;
     bet_state_account.variable_odds = variable_odds;
     bet_state_account.total_amount_accepted = 0;
 
     // pack the tournament_state_account
     bet_state_account.serialize(&mut &mut bet_state_account_info.data.borrow_mut()[..])?;
    
+    Ok(())
+}
+
+pub fn process_accept_bet<'a>(
+    program_id: &'a Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    bet_size: u64,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let acceptor_main_account_info = next_account_info(account_info_iter)?;
+    let acceptor_payment_account_info = next_account_info(account_info_iter)?;
+    let bet_state_account_info = next_account_info(account_info_iter)?;
+    let bet_escrow_account_info = next_account_info(account_info_iter)?;
+    let accepted_bet_state_account_info = next_account_info(account_info_iter)?;
+    let accepted_bet_escrow_account_info = next_account_info(account_info_iter)?;
+    let betting_market_account_info = next_account_info(account_info_iter)?;
+    let pyth_oracle_price_account_info = next_account_info(account_info_iter)?;
+    let rent = &Rent::from_account_info(next_account_info(account_info_iter)?)?;
+    let token_program_account_info = next_account_info(account_info_iter)?;
+    spl_token::check_program_account(token_program_account_info.key)?;
+    let system_program_account_info = next_account_info(account_info_iter)?;
+    if check_id(system_program_account_info.key) == false {
+        return Err(BetError::InvalidSystemProgram.into());
+    }
+    let clock = &Clock::from_account_info(next_account_info(account_info_iter)?)?;
+    let pda_account_info = next_account_info(account_info_iter)?;
+
+    // check acceptor_main_account_info is the tx signer
+    if !acceptor_main_account_info.is_signer {
+        return Err(BetError::IncorrectSigner.into());
+    }
+
+    // check program is owner of the accepted_bet_state_account_info
+    if accepted_bet_state_account_info.owner != program_id {
+        return Err(BetError::IncorrectOwner.into());
+    }
+
+    // check accepted_bet_state_account_info has enough lamports to be rent exempt
+    if !rent.is_exempt(accepted_bet_state_account_info.lamports(), accepted_bet_state_account_info.data_len()) {
+        return Err(BetError::NotRentExempt.into());
+    }
+
+    // unpack the bet and betting market accounts
+    let bet_state_account = Bet::from_account_info(bet_state_account_info)?;
+    let betting_market_account = BettingMarket::from_account_info(betting_market_account_info)?;
+    // check it is correct oracle account
+    if *pyth_oracle_price_account_info.key != bet_state_account.pyth_oracle_price_account {
+        msg!("Invalid oracle account provided.");
+        return Err(BetError::InvalidAccounts.into());
+    }
+    // get the current price of the asset
+    let pyth_price_data = pyth_oracle_price_account_info.try_borrow_data()?;
+    let price_account: Price = *load_price( &pyth_price_data ).unwrap();
+    let price: PriceConf = price_account.get_current_price().unwrap();
+
+    // check current price is valid for bet to be accepted
+    if price.price > bet_state_account.cancel_condition.above_price || price.price < bet_state_account.cancel_condition.below_price {
+        msg!("Price moved beyond cancel condition prices.");
+        return Err(BetError::BetNoLongerValid.into());
+    }
+
+    // check time isn't too late
+    if clock.unix_timestamp > bet_state_account.cancel_condition.time || clock.unix_timestamp > bet_state_account.expiration_time {
+        msg!("Time too late to accept bet.");
+        return Err(BetError::BetNoLongerValid.into());
+    }
+
+    // calculate the odds given the current price and variable odds condition
+    let bet_odds: i64;
+    if let Some(variable_odds) = bet_state_account.variable_odds {
+        let odds_change: i64;
+        let price_change: i64;
+        if bet_state_account.bet_price > bet_state_account.start_price {
+            // price starts below bet price, so when price increases, odds decrease
+            price_change = price.price - bet_state_account.start_price;
+            odds_change = 0 - (price_change / variable_odds);
+        } else {
+            // price starts above bet price, so when price increases the odds increase
+            price_change = price.price - bet_state_account.start_price;
+            odds_change = price_change / variable_odds;
+        }
+        bet_odds = bet_state_account.odds + odds_change;
+    } else {
+        bet_odds = bet_state_account.odds; // no variable odds so bet odds are unchanged
+    }
+
+    // assert odds > 100
+    if bet_odds < 100 {
+        return Err(BetError::InvalidOdds.into());
+    }
+
+    // given the odds, calculate how much the acceptor must pay
+    let acceptor_payment_amount: u64 = bet_size * ((bet_odds - 100) as u64) / 100;
+
+    // send payment from both escrow account and acceptor payment account
+    if betting_market_account.sol_payment {
+
+        // add lamports from escrow account program owns to accepted escrow account
+        **bet_escrow_account_info.lamports.borrow_mut() = bet_escrow_account_info.lamports().checked_sub(bet_size).ok_or(BetError::AmountUnderflow)?;
+        **accepted_bet_escrow_account_info.lamports.borrow_mut() = accepted_bet_escrow_account_info.lamports().checked_add(bet_size).ok_or(BetError::AmountOverflow)?;
+
+        // system program to transfer lamports from acceptor_payment_account_info
+        let transfer_lamports_from_acceptor_ix = system_instruction::transfer(
+            &acceptor_payment_account_info.key,
+            &accepted_bet_escrow_account_info.key,
+            acceptor_payment_amount
+        );
+        invoke(
+            &transfer_lamports_from_acceptor_ix,
+            &[
+                system_program_account_info.clone(),
+                acceptor_payment_account_info.clone(),
+                accepted_bet_state_account_info.clone()
+            ]
+        )?;
+    } else {
+        // transfer tokens from bet_escrow_account
+        // get the pda address and bump seed (derived from the bet_escrow_account_info Pubkey and prefix "yoyobet")
+        let bet_escrow_account_seeds = &[
+            PREFIX.as_bytes(),
+            bet_escrow_account_info.key.as_ref(),
+        ];
+        let (bet_escrow_account_pda, bump_seed) = Pubkey::find_program_address(bet_escrow_account_seeds, program_id);
+        let transfer_tokens_from_escrow_ix = spl_token::instruction::transfer(
+            token_program_account_info.key, 
+            bet_escrow_account_info.key, 
+            accepted_bet_escrow_account_info.key,
+            &bet_escrow_account_pda, 
+            &[&bet_escrow_account_pda], 
+            bet_size
+        )?;
+        // need the bump seed for the signer seeds for invoke signed
+        let bet_escrow_account_transfer_seeds = &[
+            PREFIX.as_bytes(),
+            bet_escrow_account_info.key.as_ref(),
+            &[bump_seed]
+        ];
+        invoke_signed(
+            &transfer_tokens_from_escrow_ix, 
+            &[
+                token_program_account_info.clone(),
+                bet_escrow_account_info.clone(),
+                accepted_bet_escrow_account_info.clone(),
+                pda_account_info.clone()
+            ],
+            &[bet_escrow_account_transfer_seeds]
+        )?;
+
+        // transfer tokens from acceptor_payment_account_info
+        let transfer_tokens_from_acceptor_ix = spl_token::instruction::transfer(
+            &token_program_account_info.key, 
+            &acceptor_payment_account_info.key,
+            &accepted_bet_escrow_account_info.key, 
+            &acceptor_main_account_info.key, 
+            &[&acceptor_main_account_info.key], 
+            acceptor_payment_amount
+        )?;
+        invoke(
+            &transfer_tokens_from_acceptor_ix,
+            &[
+                token_program_account_info.clone(),
+                acceptor_payment_account_info.clone(),
+                accepted_bet_escrow_account_info.clone(),
+                acceptor_main_account_info.clone()
+            ]
+        )?;
+    }
+
+    // write data to accepted bet state account
+    let mut accepted_bet_state_account = AcceptedBet::from_account_info(&accepted_bet_state_account_info)?;
+    accepted_bet_state_account.bet = *bet_state_account_info.key;
+    accepted_bet_state_account.acceptor_main_account = *acceptor_main_account_info.key;
+    accepted_bet_state_account.acceptor_payment_account = *acceptor_payment_account_info.key;
+    accepted_bet_state_account.bet_size = bet_size;
+    accepted_bet_state_account.odds = bet_odds;
+
+    // pack the tournament_state_account
+    accepted_bet_state_account.serialize(&mut &mut accepted_bet_state_account_info.data.borrow_mut()[..])?;
+
     Ok(())
 }
 
@@ -277,10 +488,5 @@ fn validate_pyth_keys(
         return Err(BetError::InvalidOracleConfig.into());
     }
 
-    // let quote_currency = get_pyth_product_quote_currency(pyth_product)?;
-    // if lending_market.quote_currency != quote_currency {
-    //     msg!("Lending market quote currency does not match the oracle quote currency");
-    //     return Err(BetError::InvalidOracleConfig.into());
-    // }
     Ok(())
 }

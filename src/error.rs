@@ -83,6 +83,14 @@ pub enum BetError {
     // No Payment Mint Given
     #[error("No payment mint given")]
     NoPaymentMintGiven,
+
+    // Bet no longer valid
+    #[error("Bet no longer valid")]
+    BetNoLongerValid,
+
+    // Invalid odds
+    #[error("Invalid odds")]
+    InvalidOdds,
 }
 
 impl PrintProgramError for BetError {

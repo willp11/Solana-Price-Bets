@@ -16,6 +16,15 @@ pub enum Direction {
     Below
 }
 
+// CANCEL BET CONDITIONS
+#[repr(C)]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq)]
+pub struct CancelCondition {
+    pub below_price: i64,
+    pub above_price: i64,
+    pub time: i64
+}
+
 // BET ACCOUNT
 pub const MAX_BET_DATA_LENGTH: usize = 1 + 32 + 32 + 1 + 32 + 2 + 8 + 32 + 32 + 8 + 1 + 8 + 8 + 8 + 8 + 8;
 
@@ -26,16 +35,16 @@ pub struct Bet {
     pub betting_market: Pubkey,
     pub creator_main_account: Pubkey, 
     pub creator_payment_account: Pubkey,
-    pub odds: u16,
+    pub odds: i64,
     pub bet_size: u64,
     pub pyth_oracle_product_account: Pubkey,
     pub pyth_oracle_price_account: Pubkey,
     pub expiration_time: i64,
-    pub bet_direction: String,
-    pub bet_price: i64,
-    pub cancel_price: i64,
-    pub cancel_time: i64,
-    pub variable_odds: i64,
+    pub bet_direction: Direction,
+    pub bet_price: i64, // price that asset must be above/below at time of bet expiration
+    pub start_price: i64, // price when bet is created
+    pub cancel_condition: CancelCondition,
+    pub variable_odds: Option<i64>,
     pub total_amount_accepted: u64
 }
 
@@ -51,6 +60,7 @@ impl Bet {
 
 pub const MAX_BETTING_MARKET_DATA_LEN: usize = 32 + 32 + 1 + 32 + 32;
 
+#[repr(C)]
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct BettingMarket {
     pub owner: Pubkey,
@@ -64,5 +74,25 @@ impl BettingMarket {
     pub fn from_account_info(a: &AccountInfo) -> Result<BettingMarket, ProgramError> {
         let market: BettingMarket = try_from_slice_checked(&a.data.borrow_mut(), MAX_BETTING_MARKET_DATA_LEN)?;
         Ok(market)
+    }
+}
+
+// ACCEPTED BET
+pub const MAX_ACCEPTED_BET_DATA_LEN: usize = 32 + 32 + 32 + 8 + 8;
+
+#[repr(C)]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct AcceptedBet {
+    pub bet: Pubkey,
+    pub acceptor_main_account: Pubkey,
+    pub acceptor_payment_account: Pubkey,
+    pub odds: i64,
+    pub bet_size: u64
+}
+
+impl AcceptedBet {
+    pub fn from_account_info(a: &AccountInfo) -> Result<AcceptedBet, ProgramError> {
+        let bet: AcceptedBet = try_from_slice_checked(&a.data.borrow_mut(), MAX_ACCEPTED_BET_DATA_LEN)?;
+        Ok(bet)
     }
 }

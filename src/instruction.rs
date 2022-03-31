@@ -6,6 +6,10 @@ use solana_program::{
     system_program
 };
 
+use crate::{
+    state::{CancelCondition, Direction}
+};
+
 #[repr(C)]
 #[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone)]
 /// Args for init betting market
@@ -19,13 +23,22 @@ pub struct InitBettingMarketArgs {
 /// Args for create bet
 pub struct CreateBetArgs {
     pub bet_size: u64,
-    pub odds: u16, // the odds given for the bet, e.g. even odds = 2.00 = 200
+    pub odds: i64, // the odds given for the bet, e.g. even odds = 2.00 = 200
     pub expiration_time: i64, // the time at which the bet expires
-    pub bet_direction: String, // "above" / "below"
+    pub bet_direction: Direction, // "above" / "below"
     pub bet_price: i64, // the price the asset must be above/below at expiration time
-    pub cancel_price: i64, // the price at which the bet is no longer valid and thus can no longer be accepted
-    pub cancel_time: i64, // the time at which the bet is no longer valid and thus can no longer be accepted
-    pub variable_odds: i64, // the amount price must change for odds to increase by 0.01
+    pub cancel_condition: CancelCondition,
+    pub variable_odds: Option<i64>, // the amount price must change for odds to increase by 1
+}
+
+#[repr(C)]
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone)]
+/// Args for accept bet
+pub struct AcceptBetArgs {
+    // how much of the original bet is being bet. (bet_size != payment amount for the acceptor). 
+    // E.g. original bet size 200, odds 1.50. Total payments = 200*1.50 = 300. (acceptors must pay 300 - 200 = 100 total)
+    // bet_size = 100, so is accepting half the original bet, so this acceptor pays 50.
+    pub bet_size: u64,
 }
 
 /// Instructions supported by the YoYo Bet program
@@ -48,6 +61,21 @@ pub enum BetInstruction {
     // [] system_program
     // [] token_program
     CreateBet(CreateBetArgs),
+
+    // [signer] acceptor_main_account
+    // [writable] acceptor_payment_account
+    // [writable] bet_state_account
+    // [writable] bet_escrow_account
+    // [writable] accepted_bet_state_account
+    // [writable] accepted_bet_escrow_account
+    // [] betting_market_account
+    // [] pyth_oracle_price_account
+    // [] rent_sysvar
+    // [] system_program
+    // [] token_program
+    // [] clock_sysvar
+    // [] PDA - has transfer authority for escrow token accounts
+    AcceptBet(AcceptBetArgs),
 }
 
 /// Creates a InitBettingMarket Instruction
@@ -89,13 +117,12 @@ pub fn create_bet(
     pyth_oracle_product_account: Pubkey,
     pyth_oracle_price_account: Pubkey,
     bet_size: u64,
-    odds: u16,
+    odds: i64,
     expiration_time: i64,
-    bet_direction: String,
+    bet_direction: Direction,
     bet_price: i64,
-    cancel_price: i64,
-    cancel_time: i64,
-    variable_odds: i64,
+    cancel_condition: CancelCondition,
+    variable_odds: Option<i64>,
 ) -> Instruction {
     Instruction {
         program_id,
@@ -117,9 +144,46 @@ pub fn create_bet(
             expiration_time,
             bet_direction,
             bet_price,
-            cancel_price,
-            cancel_time,
+            cancel_condition,
             variable_odds,
+        })
+        .try_to_vec()
+        .unwrap(),
+    }
+}
+
+/// Creates a CreateBet Instruction
+#[allow(clippy::too_many_arguments)]
+pub fn accept_bet(
+    program_id: Pubkey,
+    acceptor_main_account: Pubkey,
+    acceptor_payment_account: Pubkey,
+    bet_state_account: Pubkey,
+    bet_escrow_account: Pubkey,
+    accepted_bet_state_account: Pubkey,
+    accepted_bet_escrow_account: Pubkey,
+    betting_market_account: Pubkey,
+    pyth_oracle_price_account: Pubkey,
+    bet_size: u64,
+) -> Instruction {
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(acceptor_main_account, true),
+            AccountMeta::new(acceptor_payment_account, false),
+            AccountMeta::new(bet_state_account, false),
+            AccountMeta::new(bet_escrow_account, false),
+            AccountMeta::new(accepted_bet_state_account, false),
+            AccountMeta::new(accepted_bet_escrow_account, false),
+            AccountMeta::new_readonly(betting_market_account, false),
+            AccountMeta::new_readonly(pyth_oracle_price_account, false),
+            AccountMeta::new_readonly(sysvar::rent::id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new_readonly(sysvar::clock::id(), false),
+        ],
+        data: BetInstruction::AcceptBet(AcceptBetArgs {
+            bet_size,
         })
         .try_to_vec()
         .unwrap(),
