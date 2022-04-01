@@ -79,7 +79,14 @@ pub fn process_instruction<'a>(
                 program_id,
                 accounts,
             )
-        }
+        },
+        BetInstruction::FinalizeBet() => {
+            msg!("Instruction: Finalize Bet");
+            process_finalize_bet(
+                program_id,
+                accounts
+            )
+        },
     }
 }
 
@@ -387,6 +394,12 @@ pub fn process_accept_bet<'a>(
     // send payment from both escrow account and acceptor payment account
     if betting_market_account.sol_payment {
 
+        // check program is owner of the accepted bet escrow account
+        if accepted_bet_escrow_account_info.key != program_id {
+            msg!("Program is not owner of the bet escrow account");
+            return Err(BetError::IncorrectOwner.into());
+        }
+
         // add lamports from escrow account program owns to accepted escrow account
         **bet_escrow_account_info.lamports.borrow_mut() = bet_escrow_account_info.lamports().checked_sub(bet_size).ok_or(BetError::AmountUnderflow)?;
         **accepted_bet_escrow_account_info.lamports.borrow_mut() = accepted_bet_escrow_account_info.lamports().checked_add(bet_size).ok_or(BetError::AmountOverflow)?;
@@ -406,13 +419,40 @@ pub fn process_accept_bet<'a>(
             ]
         )?;
     } else {
-        // transfer tokens from bet_escrow_account
         // get the pda address and bump seed (derived from the bet_escrow_account_info Pubkey and prefix "yoyobet")
         let bet_escrow_account_seeds = &[
             PREFIX.as_bytes(),
             bet_escrow_account_info.key.as_ref(),
         ];
         let (bet_escrow_account_pda, bump_seed) = Pubkey::find_program_address(bet_escrow_account_seeds, program_id);
+
+        // set transfer authority of the accepted bet escrow to PDA
+        let transfer_authority_change_ix = spl_token::instruction::set_authority(
+            token_program_account_info.key,
+            accepted_bet_escrow_account_info.key,
+            Some(&bet_escrow_account_pda),
+            spl_token::instruction::AuthorityType::AccountOwner,
+            acceptor_main_account_info.key,
+            &[&acceptor_main_account_info.key],
+        )?;
+        msg!("Calling the token program to transfer ownership authority to PDA...");
+        invoke(
+            &transfer_authority_change_ix,
+            &[
+                accepted_bet_escrow_account_info.clone(),
+                acceptor_main_account_info.clone(),
+                token_program_account_info.clone(),
+            ],
+        )?;
+
+        // need the bump seed for the signer seeds for invoke signed
+        let bet_escrow_account_transfer_seeds = &[
+            PREFIX.as_bytes(),
+            bet_escrow_account_info.key.as_ref(),
+            &[bump_seed]
+        ];
+
+        // transfer tokens from bet_escrow_account
         let transfer_tokens_from_escrow_ix = spl_token::instruction::transfer(
             token_program_account_info.key, 
             bet_escrow_account_info.key, 
@@ -421,12 +461,6 @@ pub fn process_accept_bet<'a>(
             &[&bet_escrow_account_pda], 
             bet_size
         )?;
-        // need the bump seed for the signer seeds for invoke signed
-        let bet_escrow_account_transfer_seeds = &[
-            PREFIX.as_bytes(),
-            bet_escrow_account_info.key.as_ref(),
-            &[bump_seed]
-        ];
         invoke_signed(
             &transfer_tokens_from_escrow_ix, 
             &[
@@ -461,10 +495,12 @@ pub fn process_accept_bet<'a>(
     // write data to accepted bet state account
     let mut accepted_bet_state_account = AcceptedBet::from_account_info(&accepted_bet_state_account_info)?;
     accepted_bet_state_account.bet = *bet_state_account_info.key;
+    accepted_bet_state_account.accepted_bet_escrow_account = *accepted_bet_escrow_account_info.key;
     accepted_bet_state_account.acceptor_main_account = *acceptor_main_account_info.key;
     accepted_bet_state_account.acceptor_payment_account = *acceptor_payment_account_info.key;
     accepted_bet_state_account.bet_size = bet_size;
     accepted_bet_state_account.odds = bet_odds;
+    accepted_bet_state_account.finalized = false;
 
     // pack the tournament_state_account
     accepted_bet_state_account.serialize(&mut &mut accepted_bet_state_account_info.data.borrow_mut()[..])?;
@@ -575,6 +611,244 @@ pub fn process_cancel_bet<'a>(
 
     // pack the bet_state_account
     bet_state_account.serialize(&mut &mut bet_state_account_info.data.borrow_mut()[..])?;
+
+    Ok(())
+}
+
+pub fn process_finalize_bet<'a>(
+    program_id: &'a Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let finalizer_main_account_info = next_account_info(account_info_iter)?;
+    let finalizer_payment_account_info = next_account_info(account_info_iter)?;
+    let commission_fee_account_info = next_account_info(account_info_iter)?;
+    let bet_state_account_info = next_account_info(account_info_iter)?;
+    let accepted_bet_state_account_info = next_account_info(account_info_iter)?;
+    let accepted_bet_escrow_account_info = next_account_info(account_info_iter)?;
+    let creator_payment_account_info = next_account_info(account_info_iter)?;
+    let acceptor_payment_account_info = next_account_info(account_info_iter)?;
+    let betting_market_account_info = next_account_info(account_info_iter)?;
+    let pyth_oracle_price_account_info = next_account_info(account_info_iter)?;
+    let token_program_account_info = next_account_info(account_info_iter)?;
+    spl_token::check_program_account(token_program_account_info.key)?;
+    let system_program_account_info = next_account_info(account_info_iter)?;
+    if check_id(system_program_account_info.key) == false {
+        return Err(BetError::InvalidSystemProgram.into());
+    }
+    let pda_account_info = next_account_info(account_info_iter)?;
+    let clock = &Clock::from_account_info(next_account_info(account_info_iter)?)?;
+
+    if !finalizer_main_account_info.is_signer {
+        return Err(BetError::IncorrectSigner.into());
+    }
+
+    // unpack the state accounts
+    let bet_state_account = Bet::from_account_info(bet_state_account_info)?;
+    let mut accepted_bet_state_account = AcceptedBet::from_account_info(accepted_bet_state_account_info)?;
+    let betting_market_account = BettingMarket::from_account_info(betting_market_account_info)?;
+    // check bet hasn't already been finalized
+    if accepted_bet_state_account.finalized {
+        msg!("Bet already finalized");
+        return Err(BetError::BetFinalized.into());
+    }
+    // check it is correct betting market account
+    if bet_state_account.betting_market != *betting_market_account_info.key {
+        msg!("Wrong betting market account");
+        return Err(BetError::InvalidAccounts.into());
+    }
+    // check it is correct pyth oracle account
+    if bet_state_account.pyth_oracle_price_account != *pyth_oracle_price_account_info.key {
+        msg!("Wrong pyth price account");
+        return Err(BetError::InvalidAccounts.into());
+    }
+    // check it is correct commission fee account
+    if betting_market_account.fee_commission_account != *commission_fee_account_info.key {
+        msg!("Wrong commission fee account");
+        return Err(BetError::InvalidAccounts.into());
+    }
+    // check it is correct creator account
+    if bet_state_account.creator_payment_account != *creator_payment_account_info.key {
+        msg!("Wrong bet creator payment account");
+        return Err(BetError::InvalidAccounts.into());
+    }
+    // check it is correct acceptor payment account
+    if accepted_bet_state_account.acceptor_payment_account != *acceptor_payment_account_info.key {
+        msg!("Wrong bet acceptor payment account");
+        return Err(BetError::InvalidAccounts.into());
+    }
+    // check it is correct escrow account
+    if accepted_bet_state_account.accepted_bet_escrow_account != * accepted_bet_state_account_info.key {
+        msg!("Wrong escrow account");
+        return Err(BetError::InvalidAccounts.into());
+    }
+
+    // check time is after bet expiration time
+    if clock.unix_timestamp < bet_state_account.expiration_time {
+        msg!("Time is before bet expiration time");
+        return Err(BetError::BeforeExpiryTime.into());
+    }
+
+    // get price from pyth oracle
+    let pyth_price_data = pyth_oracle_price_account_info.try_borrow_data()?;
+    let price_account: Price = *load_price( &pyth_price_data ).unwrap();
+    let price: PriceConf = price_account.get_current_price().unwrap();
+
+    // determine the bet winner
+    let bet_winner_account_info: &AccountInfo;
+    match bet_state_account.bet_direction {
+        Direction::Above => {
+            if price.price >= bet_state_account.bet_price {
+                bet_winner_account_info = creator_payment_account_info;
+            } else {
+                bet_winner_account_info = acceptor_payment_account_info;
+            }
+        },
+        Direction::Below => {
+            if price.price <= bet_state_account.bet_price {
+                bet_winner_account_info = creator_payment_account_info;
+            } else {
+                bet_winner_account_info = acceptor_payment_account_info;
+            }
+        } 
+    }
+
+    // calculate commission amount
+    let commission_amount = accepted_bet_state_account.bet_size / 50;
+    let finalizer_amount = commission_amount / 4;
+    let winner_amount = accepted_bet_state_account.bet_size - commission_amount - finalizer_amount;
+
+    // send payments to commission, winner and finalizer
+    if betting_market_account.sol_payment {
+        // transfer to commission account
+        msg!("Calling system program to transfer lamports to commission account");
+        let transfer_lamports_from_escrow_to_commission_ix = system_instruction::transfer(
+            &accepted_bet_escrow_account_info.key,
+            &commission_fee_account_info.key,
+            commission_amount
+        );
+        invoke(
+            &transfer_lamports_from_escrow_to_commission_ix,
+            &[
+                system_program_account_info.clone(),
+                accepted_bet_escrow_account_info.clone(),
+                commission_fee_account_info.clone()
+            ]
+        )?;
+
+        // transfer to finalizer
+        msg!("Calling system program to transfer lamports to finalizer account");
+        let transfer_lamports_from_escrow_to_finalizer_ix = system_instruction::transfer(
+            &accepted_bet_escrow_account_info.key,
+            &finalizer_payment_account_info.key,
+            finalizer_amount
+        );
+        invoke(
+            &transfer_lamports_from_escrow_to_finalizer_ix,
+            &[
+                system_program_account_info.clone(),
+                accepted_bet_escrow_account_info.clone(),
+                finalizer_payment_account_info.clone()
+            ]
+        )?;
+
+        // transfer to winner
+        msg!("Calling system program to transfer lamports to finalizer account");
+        let transfer_lamports_from_escrow_to_winner_ix = system_instruction::transfer(
+            &accepted_bet_escrow_account_info.key,
+            &bet_winner_account_info.key,
+            winner_amount
+        );
+        invoke(
+            &transfer_lamports_from_escrow_to_winner_ix,
+            &[
+                system_program_account_info.clone(),
+                accepted_bet_escrow_account_info.clone(),
+                bet_winner_account_info.clone()
+            ]
+        )?;
+    } else {
+        // get pda address, bump seed and seeds
+        let bet_escrow_account_seeds = &[
+            PREFIX.as_bytes(),
+            bet_state_account.bet_escrow_account.as_ref(),
+        ];
+        let (bet_escrow_account_pda, bump_seed) = Pubkey::find_program_address(bet_escrow_account_seeds, program_id);
+        let bet_escrow_transfer_seeds = &[
+            PREFIX.as_bytes(),
+            bet_state_account.bet_escrow_account.as_ref(),
+            &[bump_seed]
+        ];
+
+        // transfer tokens to commission account
+        msg!("Calling token program to transfer tokens to commission account");
+        let transfer_tokens_from_escrow_to_commission_ix = spl_token::instruction::transfer(
+            token_program_account_info.key, 
+            accepted_bet_escrow_account_info.key, 
+            commission_fee_account_info.key, 
+            &bet_escrow_account_pda, 
+            &[&bet_escrow_account_pda], 
+            commission_amount
+        )?;
+        invoke_signed(
+            &transfer_tokens_from_escrow_to_commission_ix, 
+            &[
+                token_program_account_info.clone(),
+                accepted_bet_escrow_account_info.clone(),
+                commission_fee_account_info.clone(),
+                pda_account_info.clone()
+            ], 
+            &[bet_escrow_transfer_seeds]
+        )?;
+
+        // transfer tokens to winner payment account
+        msg!("Calling token program to transfer tokens to commission account");
+        let transfer_tokens_from_escrow_to_winner_ix = spl_token::instruction::transfer(
+            token_program_account_info.key, 
+            accepted_bet_escrow_account_info.key, 
+            bet_winner_account_info.key, 
+            &bet_escrow_account_pda, 
+            &[&bet_escrow_account_pda], 
+            winner_amount
+        )?;
+        invoke_signed(
+            &transfer_tokens_from_escrow_to_winner_ix, 
+            &[
+                token_program_account_info.clone(),
+                accepted_bet_escrow_account_info.clone(),
+                bet_winner_account_info.clone(),
+                pda_account_info.clone()
+            ], 
+            &[bet_escrow_transfer_seeds]
+        )?;
+
+        // transfer tokens to finalizer payment account
+        msg!("Calling token program to transfer tokens to finalizer account");
+        let transfer_tokens_from_escrow_to_finalizer_ix = spl_token::instruction::transfer(
+            token_program_account_info.key, 
+            accepted_bet_escrow_account_info.key, 
+            finalizer_payment_account_info.key, 
+            &bet_escrow_account_pda, 
+            &[&bet_escrow_account_pda], 
+            finalizer_amount
+        )?;
+        invoke_signed(
+            &transfer_tokens_from_escrow_to_finalizer_ix, 
+            &[
+                token_program_account_info.clone(),
+                accepted_bet_escrow_account_info.clone(),
+                finalizer_payment_account_info.clone(),
+                pda_account_info.clone()
+            ], 
+            &[bet_escrow_transfer_seeds]
+        )?;
+    }
+
+    // update accepted bet state, set finalized to true
+    accepted_bet_state_account.finalized = true;
+
+    // pack state account
+    accepted_bet_state_account.serialize(&mut &mut accepted_bet_state_account_info.data.borrow_mut()[..])?;
 
     Ok(())
 }

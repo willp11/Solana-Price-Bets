@@ -95,6 +95,14 @@ pub enum BetError {
     // Bet cancelled
     #[error("Bet cancelled")]
     BetCancelled,
+
+    // Bet already finalized
+    #[error("Bet already finalized")]
+    BetFinalized,
+
+    // Before bet expiry time
+    #[error("Before expiry time")]
+    BeforeExpiryTime,
 }
 
 impl PrintProgramError for BetError {

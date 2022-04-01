@@ -86,10 +86,12 @@ pub const MAX_ACCEPTED_BET_DATA_LEN: usize = 32 + 32 + 32 + 8 + 8;
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct AcceptedBet {
     pub bet: Pubkey,
+    pub accepted_bet_escrow_account: Pubkey,
     pub acceptor_main_account: Pubkey,
     pub acceptor_payment_account: Pubkey,
     pub odds: i64,
-    pub bet_size: u64
+    pub bet_size: u64,
+    pub finalized: bool
 }
 
 impl AcceptedBet {

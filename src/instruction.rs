@@ -86,6 +86,22 @@ pub enum BetInstruction {
     // [] token_program
     // [] PDA
     CancelBet(),
+
+    // [signer] finalizer_main_account
+    // [writable] finalizer_payment_account
+    // [writable] commission_fee_account
+    // [] bet_state_account
+    // [] accepted_bet_state_account
+    // [writable] accepted_bet_escrow_account
+    // [writable] creator_payment_account
+    // [writable] acceptor_payment_account
+    // [] pyth_price_account
+    // [] betting_market_account
+    // [] system_program
+    // [] token_program
+    // [] PDA
+    // [] clock_sysvar
+    FinalizeBet(),
 }
 
 /// Creates a InitBettingMarket Instruction
