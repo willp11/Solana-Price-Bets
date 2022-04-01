@@ -91,6 +91,10 @@ pub enum BetError {
     // Invalid odds
     #[error("Invalid odds")]
     InvalidOdds,
+
+    // Bet cancelled
+    #[error("Bet cancelled")]
+    BetCancelled,
 }
 
 impl PrintProgramError for BetError {

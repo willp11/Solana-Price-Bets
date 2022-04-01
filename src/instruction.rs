@@ -76,6 +76,16 @@ pub enum BetInstruction {
     // [] clock_sysvar
     // [] PDA - has transfer authority for escrow token accounts
     AcceptBet(AcceptBetArgs),
+
+    // [signer] creator_main_account
+    // [writable] creator_payment_account
+    // [writable] bet_state_account
+    // [writable] bet_escrow_account
+    // [] betting_market_account
+    // [] system_program
+    // [] token_program
+    // [] PDA
+    CancelBet(),
 }
 
 /// Creates a InitBettingMarket Instruction

@@ -35,6 +35,7 @@ pub struct Bet {
     pub betting_market: Pubkey,
     pub creator_main_account: Pubkey, 
     pub creator_payment_account: Pubkey,
+    pub bet_escrow_account: Pubkey,
     pub odds: i64,
     pub bet_size: u64,
     pub pyth_oracle_product_account: Pubkey,
@@ -45,7 +46,8 @@ pub struct Bet {
     pub start_price: i64, // price when bet is created
     pub cancel_condition: CancelCondition,
     pub variable_odds: Option<i64>,
-    pub total_amount_accepted: u64
+    pub total_amount_accepted: u64,
+    pub cancelled: bool
 }
 
 impl Bet {

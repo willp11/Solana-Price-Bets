@@ -72,6 +72,13 @@ pub fn process_instruction<'a>(
                 accounts,
                 args.bet_size
             )
+        },
+        BetInstruction::CancelBet() => {
+            msg!("Instruction: Cancel Bet");
+            process_cancel_bet(
+                program_id,
+                accounts,
+            )
         }
     }
 }
@@ -248,6 +255,7 @@ pub fn process_create_bet<'a>(
     bet_state_account.is_initialized = true;
     bet_state_account.creator_main_account = *creator_main_account_info.key;
     bet_state_account.creator_payment_account = *creator_payment_account_info.key;
+    bet_state_account.bet_escrow_account = *bet_escrow_account_info.key;
     bet_state_account.odds = odds;
     bet_state_account.bet_size = bet_size;
     bet_state_account.pyth_oracle_product_account = *pyth_oracle_product_account_info.key;
@@ -259,8 +267,9 @@ pub fn process_create_bet<'a>(
     bet_state_account.cancel_condition = cancel_condition;
     bet_state_account.variable_odds = variable_odds;
     bet_state_account.total_amount_accepted = 0;
+    bet_state_account.cancelled = false;
 
-    // pack the tournament_state_account
+    // pack the bet_state_account
     bet_state_account.serialize(&mut &mut bet_state_account_info.data.borrow_mut()[..])?;
    
     Ok(())
@@ -308,6 +317,24 @@ pub fn process_accept_bet<'a>(
     // unpack the bet and betting market accounts
     let bet_state_account = Bet::from_account_info(bet_state_account_info)?;
     let betting_market_account = BettingMarket::from_account_info(betting_market_account_info)?;
+
+    // check it is correct betting market account
+    if bet_state_account.betting_market != *betting_market_account_info.key {
+        msg!("Incorrect betting market account");
+        return Err(BetError::InvalidAccounts.into());
+    }
+
+    // check it is correct escrow account
+    if bet_state_account.bet_escrow_account != *bet_escrow_account_info.key {
+        msg!("Incorrect escrow account");
+        return Err(BetError::InvalidAccounts.into());
+    }
+
+    // check bet hasn't been cancelled
+    if bet_state_account.cancelled == true {
+        return Err(BetError::BetCancelled.into());
+    }
+
     // check it is correct oracle account
     if *pyth_oracle_price_account_info.key != bet_state_account.pyth_oracle_price_account {
         msg!("Invalid oracle account provided.");
@@ -441,6 +468,113 @@ pub fn process_accept_bet<'a>(
 
     // pack the tournament_state_account
     accepted_bet_state_account.serialize(&mut &mut accepted_bet_state_account_info.data.borrow_mut()[..])?;
+
+    Ok(())
+}
+
+pub fn process_cancel_bet<'a>(
+    program_id: &'a Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let creator_main_account_info = next_account_info(account_info_iter)?;
+    let creator_payment_account_info = next_account_info(account_info_iter)?;
+    let bet_state_account_info = next_account_info(account_info_iter)?;
+    let bet_escrow_account_info = next_account_info(account_info_iter)?;
+    let betting_market_account_info = next_account_info(account_info_iter)?;
+    let token_program_account_info = next_account_info(account_info_iter)?;
+    spl_token::check_program_account(token_program_account_info.key)?;
+    let system_program_account_info = next_account_info(account_info_iter)?;
+    if check_id(system_program_account_info.key) == false {
+        return Err(BetError::InvalidSystemProgram.into());
+    }
+    let pda_account_info = next_account_info(account_info_iter)?;
+
+    // check creator main account is signer
+    if !creator_main_account_info.is_signer {
+        return Err(BetError::IncorrectSigner.into());
+    }
+
+    // unpack state account data
+    let mut bet_state_account = Bet::from_account_info(bet_state_account_info)?;
+    let betting_market_account = BettingMarket::from_account_info(betting_market_account_info)?;
+
+    // check creator main account created the bet
+    if bet_state_account.creator_main_account != *creator_main_account_info.key {
+        msg!("Signer did not create the bet!");
+        return Err(BetError::InvalidAccounts.into());
+    }
+
+    // check it is correct betting market account
+    if bet_state_account.betting_market != *betting_market_account_info.key {
+        msg!("Incorrect betting market account");
+        return Err(BetError::InvalidAccounts.into());
+    }
+
+    // check it is correct escrow account
+    if bet_state_account.bet_escrow_account != *bet_escrow_account_info.key {
+        msg!("Incorrect escrow account");
+        return Err(BetError::InvalidAccounts.into());
+    }
+
+    // send lamports / tokens from escrow account to creator payment account
+    if betting_market_account.sol_payment == true {
+        msg!("Calling system program to transfer tokens to bet creator");
+        let transfer_lamports_from_escrow_ix = system_instruction::transfer(
+            &bet_escrow_account_info.key,
+            &creator_payment_account_info.key,
+            bet_escrow_account_info.lamports()
+        );
+        invoke(
+            &transfer_lamports_from_escrow_ix,
+            &[
+                system_program_account_info.clone(),
+                bet_escrow_account_info.clone(),
+                creator_payment_account_info.clone()
+            ]
+        )?;
+    } else {
+        // get pda address, bump seed and seeds
+        let bet_escrow_account_seeds = &[
+            PREFIX.as_bytes(),
+            bet_escrow_account_info.key.as_ref(),
+        ];
+        let (bet_escrow_account_pda, bump_seed) = Pubkey::find_program_address(bet_escrow_account_seeds, program_id);
+        let bet_escrow_transfer_seeds = &[
+            PREFIX.as_bytes(),
+            bet_escrow_account_info.key.as_ref(),
+            &[bump_seed]
+        ];
+
+        // unpack token account to get amount in there
+        let bet_escrow_account = TokenAccount::unpack_from_slice(&bet_escrow_account_info.data.borrow())?;
+
+        msg!("Calling token program to transfer tokens to bet creator");
+        let transfer_tokens_from_escrow_ix = spl_token::instruction::transfer(
+            token_program_account_info.key, 
+            bet_escrow_account_info.key, 
+            creator_payment_account_info.key, 
+            &bet_escrow_account_pda, 
+            &[&bet_escrow_account_pda], 
+            bet_escrow_account.amount
+        )?;
+        invoke_signed(
+            &transfer_tokens_from_escrow_ix, 
+            &[
+                token_program_account_info.clone(),
+                bet_escrow_account_info.clone(),
+                creator_payment_account_info.clone(),
+                pda_account_info.clone()
+            ], 
+            &[bet_escrow_transfer_seeds]
+        )?;
+    }
+
+    // cancel the bet so noone in future can try to accept it
+    bet_state_account.cancelled = true;
+
+    // pack the bet_state_account
+    bet_state_account.serialize(&mut &mut bet_state_account_info.data.borrow_mut()[..])?;
 
     Ok(())
 }
